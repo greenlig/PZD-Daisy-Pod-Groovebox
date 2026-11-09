@@ -1,12 +1,11 @@
-// Pod Looper - a screenless 4-layer stereo looper for a stock Electrosmith
-// Daisy Pod, with MIDI clock sync (built around a Roland P-6).
+// Pod Looper - a screenless 4-track looper for a stock Electrosmith Daisy
+// Pod, with its own tempo or MIDI clock sync (built around a Roland P-6).
 //
 // This file is the Pod-specific part: it reads the buttons, encoder, knobs
 // and MIDI, drives the two RGB LEDs, and feeds audio through looper::Engine.
 // See README.md for the controls.
 
 #include <cmath>
-#include <cstring>
 
 #include "daisy_pod.h"
 
@@ -15,19 +14,23 @@
 #include "spsc_queue.h"
 
 using namespace daisy;
+using looper::Quantize;
+using looper::StartMode;
+using looper::TrackState;
 
 namespace
 {
-constexpr int    kLayers    = cfg::kNumLayers;
+constexpr int    kTracks    = cfg::kNumTracks;
 constexpr size_t kMaxFrames = static_cast<size_t>(cfg::kMaxLoopSeconds * cfg::kSampleRate);
 
-static_assert(kLayers <= looper::kMaxLayers, "too many layers");
-static_assert(2ull * kLayers * kMaxFrames * sizeof(float) <= 64ull * 1024 * 1024,
+static_assert(kTracks <= looper::kMaxTracks, "too many tracks");
+static_assert(2ull * (kTracks + 1) * kMaxFrames * sizeof(int16_t) <= 64ull * 1024 * 1024,
               "loop buffers don't fit in the Seed's 64 MB SDRAM");
 
-constexpr uint32_t kClearHoldMs    = 1000; // hold Button 2: clear this layer
-constexpr uint32_t kClearAllHoldMs = 3000; // keep holding: clear every layer
-constexpr int      kBootSettleMs   = 200;  // let the knob readings settle
+constexpr uint32_t kClearHoldMs      = 1000; // hold Button 2: clear this track
+constexpr uint32_t kStartFreshHoldMs = 3000; // keep holding: start fresh
+constexpr uint32_t kClickMaxMs       = 600;  // encoder press shorter than this = Play/Stop
+constexpr int      kBootSettleMs     = 200;  // let the knob readings settle
 
 struct Rgb
 {
@@ -37,13 +40,25 @@ constexpr Rgb kOff{0.f, 0.f, 0.f};
 constexpr Rgb kRed{1.f, 0.f, 0.f};
 constexpr Rgb kAmber{1.f, 0.6f, 0.f};
 constexpr Rgb kGreen{0.f, 1.f, 0.f};
+constexpr Rgb kCyan{0.f, 1.f, 1.f};
 constexpr Rgb kBlue{0.f, 0.f, 0.8f};
 constexpr Rgb kWhite{1.f, 1.f, 1.f};
-// LED 1 colour for layers 1-4: cyan, magenta, yellow, white.
-constexpr Rgb kLayerColour[4] = {{0.f, 1.f, 1.f},
+// LED 1 colour for tracks 1-4: cyan, magenta, yellow, white.
+constexpr Rgb kTrackColour[4] = {{0.f, 1.f, 1.f},
                                  {1.f, 0.f, 1.f},
                                  {1.f, 1.f, 0.f},
                                  {1.f, 1.f, 1.f}};
+constexpr float kDim = 0.45f; // LED 1 between beats (the LED driver cubes it)
+
+// Record modes in the order Shift + Button 2 steps through them.
+constexpr looper::RecordMode kModes[] = {
+    {Quantize::Bar, StartMode::Immediate},
+    {Quantize::Bar, StartMode::Armed},
+    {Quantize::Beat, StartMode::Immediate},
+    {Quantize::Beat, StartMode::Armed},
+    {Quantize::Free, StartMode::Immediate},
+};
+constexpr int kNumModes = sizeof(kModes) / sizeof(kModes[0]);
 
 // MIDI clock/Start/Stop, stamped with their arrival time in the UART
 // interrupt so the audio callback can place them to within a sample or two.
@@ -62,7 +77,7 @@ struct RemoteMsg
 };
 
 // A knob only takes over a value once it has been moved, so selecting a
-// layer (or a CC change) never makes the level jump.
+// track (or a CC change) never makes the level jump.
 struct Pickup
 {
     float ref  = 0.f;
@@ -85,38 +100,59 @@ struct Pickup
 DaisyPod       hw;
 looper::Engine engine;
 
-float DSY_SDRAM_BSS buf_l[kLayers][kMaxFrames];
-float DSY_SDRAM_BSS buf_r[kLayers][kMaxFrames];
+int16_t DSY_SDRAM_BSS buf_l[kTracks][kMaxFrames];
+int16_t DSY_SDRAM_BSS buf_r[kTracks][kMaxFrames];
+int16_t DSY_SDRAM_BSS undo_l[kMaxFrames];
+int16_t DSY_SDRAM_BSS undo_r[kMaxFrames];
 
 SpscQueue<SyncMsg, 128>  sync_q;
 SpscQueue<RemoteMsg, 64> remote_q;
 
 // UI state, touched only by the audio callback.
 int      selected      = 0;
+int      mode_index    = 0;
 Pickup   knob1, knob2;
-bool     b2_cleared     = false;
-bool     b2_cleared_all = false;
-int      boot_blocks    = 0;
-uint32_t blink_until    = 0;
-uint32_t flash_until    = 0;
-uint32_t last_wraps     = 0;
-uint32_t last_bars      = 0;
-float    frames_per_us  = 0.048f;
+bool     b2_cleared    = false;
+bool     b2_fresh      = false;
+bool     b2_was_shift  = false;
+uint32_t enc_down_at   = 0;
+bool     shift_used    = false;
+int      boot_blocks   = 0;
+uint32_t beat_flash_until = 0;
+bool     beat_flash_bar   = false;
+uint32_t last_beat_count  = 0;
+uint32_t confirm_until    = 0; // white flash on LED 2
+uint32_t refuse_until     = 0; // red flash on LED 2
+uint32_t show_mode_until  = 0;
+float    frames_per_us    = 0.048f;
 
 inline float KnobToGain(float k)
 {
     return 1.5f * k * k; // unity at about 80 %, up to +3.5 dB
 }
 
-void SelectLayer(int layer)
+void SelectTrack(int t)
 {
-    selected = layer;
+    selected = t;
     knob1.Hold(hw.knob1.Value());
 }
 
-void Flash(uint32_t now)
+void Confirm(uint32_t now)
 {
-    flash_until = now + 200;
+    confirm_until = now + 200;
+}
+
+void Refuse(uint32_t now)
+{
+    refuse_until = now + 200;
+}
+
+void DoUndo(uint32_t now)
+{
+    if(engine.Undo())
+        Confirm(now);
+    else
+        Refuse(now);
 }
 
 // ------------------------------------------------------------------- MIDI
@@ -166,6 +202,12 @@ void PollMidi()
 }
 
 // --------------------------------------------------------------- controls
+//
+// The encoder doubles as Shift: hold it down and
+//   turn       = tempo -/+ 1 BPM
+//   Button 1   = undo / redo
+//   Button 2   = next record mode
+// A short click on its own (no Shift action) is Play / Stop.
 
 void HandleControls(uint32_t now)
 {
@@ -176,56 +218,93 @@ void HandleControls(uint32_t now)
     if(boot_blocks < kBootSettleMs)
     {
         ++boot_blocks;
-        knob1.Hold(k1);  // layer volumes start at unity
+        knob1.Hold(k1);  // track volumes start at unity
         knob2.ref  = k2; // the input level follows Knob 2 from the start
         knob2.live = true;
         engine.SetMonitor(KnobToGain(k2));
         return;
     }
 
-    // Encoder: turn to pick a layer, click to pause/resume everything.
+    if(hw.encoder.RisingEdge())
+    {
+        enc_down_at = now;
+        shift_used  = false;
+    }
+    const bool shift = hw.encoder.Pressed();
+
     const int inc = hw.encoder.Increment();
     if(inc != 0)
-        SelectLayer(((selected + inc) % kLayers + kLayers) % kLayers);
-    if(hw.encoder.RisingEdge())
-        engine.TogglePause();
+    {
+        if(shift)
+        {
+            shift_used = true;
+            if(!engine.SetTempo(std::round(engine.Tempo()) + static_cast<float>(inc)))
+                Refuse(now); // locked: following MIDI clock, or grid tracks recorded
+        }
+        else
+            SelectTrack(((selected + inc) % kTracks + kTracks) % kTracks);
+    }
 
-    // Button 1: Rec / Play / Dub.
+    if(hw.encoder.FallingEdge() && !shift_used && now - enc_down_at < kClickMaxMs)
+    {
+        if(!engine.TransportToggle())
+            Refuse(now); // the P-6 is in charge of Play/Stop
+    }
+
+    // Button 1: Rec / Play / Dub (Shift: undo / redo).
     if(hw.button1.RisingEdge())
-        engine.RecPlayDub(selected);
+    {
+        if(shift)
+        {
+            shift_used = true;
+            DoUndo(now);
+        }
+        else
+            engine.RecPlayDub(selected);
+    }
 
-    // Button 2: tap = mute/unmute, hold 1 s = clear layer, 3 s = clear all.
+    // Button 2: tap = mute/unmute, hold 1 s = clear track, 3 s = start fresh
+    // (Shift: next record mode).
     if(hw.button2.RisingEdge())
     {
-        engine.StopToggle(selected);
-        b2_cleared     = false;
-        b2_cleared_all = false;
+        b2_cleared   = false;
+        b2_fresh     = false;
+        b2_was_shift = shift;
+        if(shift)
+        {
+            shift_used = true;
+            mode_index = (mode_index + 1) % kNumModes;
+            engine.SetRecordMode(kModes[mode_index]);
+            show_mode_until = now + 1500;
+        }
+        else
+            engine.StopToggle(selected);
     }
-    if(hw.button2.Pressed())
+    if(hw.button2.Pressed() && !b2_was_shift)
     {
         const float held = hw.button2.TimeHeldMs();
         if(!b2_cleared && held >= kClearHoldMs)
         {
             engine.Clear(selected);
             b2_cleared = true;
-            Flash(now);
+            Confirm(now);
         }
-        if(!b2_cleared_all && held >= kClearAllHoldMs)
+        if(!b2_fresh && held >= kStartFreshHoldMs)
         {
-            engine.ClearAll();
-            b2_cleared_all = true;
-            Flash(now);
+            engine.StartFresh();
+            b2_fresh = true;
+            Confirm(now);
         }
     }
 
-    // Knob 1: selected layer's volume. Knob 2: live input level.
+    // Knob 1: selected track's volume. Knob 2: live input level.
     if(knob1.Update(k1))
         engine.SetVolume(selected, KnobToGain(k1));
     if(knob2.Update(k2))
         engine.SetMonitor(KnobToGain(k2));
 }
 
-void HandleRemote()
+void HandleRemote(uint32_t now)
 {
     RemoteMsg m;
     while(remote_q.Pop(m))
@@ -233,24 +312,24 @@ void HandleRemote()
         if(!m.is_cc)
         {
             const int pad = static_cast<int>(m.num) - cfg::kPadNoteBase;
-            if(pad >= 0 && pad < kLayers)
+            if(pad >= 0 && pad < kTracks)
             {
-                SelectLayer(pad);
+                SelectTrack(pad);
                 engine.RecPlayDub(pad);
             }
-            else if(pad == kLayers)
+            else if(pad == kTracks)
                 engine.StopToggle(selected);
-            else if(pad == kLayers + 1)
-                engine.TogglePause();
+            else if(pad == kTracks + 1)
+                DoUndo(now);
         }
         else
         {
-            const float v     = m.value / 127.f;
-            const int   layer = static_cast<int>(m.num) - cfg::kLayerVolumeCcBase;
-            if(layer >= 0 && layer < kLayers)
+            const float v = m.value / 127.f;
+            const int   t = static_cast<int>(m.num) - cfg::kTrackVolumeCcBase;
+            if(t >= 0 && t < kTracks)
             {
-                engine.SetVolume(layer, KnobToGain(v));
-                if(layer == selected)
+                engine.SetVolume(t, KnobToGain(v));
+                if(t == selected)
                     knob1.Hold(hw.knob1.Value());
             }
             else if(m.num == cfg::kMonitorCc)
@@ -264,50 +343,59 @@ void HandleRemote()
 
 // ------------------------------------------------------------------- LEDs
 //
-// LED 1: which layer is selected (colour), blinking off briefly at the top
-//        of the loop - or on every bar while the P-6 clock is running and
-//        there's no loop yet.
-// LED 2: what that layer is doing - off empty, flashing red armed, red
-//        recording (flickering while it waits for the bar to stop), amber
-//        overdubbing, green playing, blue muted. Slow blink = paused.
-//        A white flash confirms a clear.
+// LED 1: the selected track's colour, pulsing bright on every beat and white
+//        on the first beat of each bar. Steady and dim = stopped.
+// LED 2: what that track is doing (see README), or the record mode while
+//        the encoder is held.
+
+Rgb Scale(Rgb c, float k)
+{
+    return {c.r * k, c.g * k, c.b * k};
+}
+
 void UpdateLeds(uint32_t now)
 {
-    const uint32_t wraps = engine.LoopWraps();
-    const uint32_t bars  = engine.BarCount();
-    if(wraps != last_wraps)
+    const uint32_t beats = engine.BeatCount();
+    if(beats != last_beat_count)
     {
-        last_wraps = wraps;
-        blink_until = now + 60;
+        last_beat_count  = beats;
+        beat_flash_until = now + 90;
+        beat_flash_bar   = engine.LastBeatWasBar();
     }
-    if(bars != last_bars)
-    {
-        last_bars = bars;
-        if(!engine.HasLoop())
-            blink_until = now + 60;
-    }
-    Rgb c1 = now < blink_until ? kOff : kLayerColour[selected % 4];
+    const Rgb track = kTrackColour[selected % 4];
+    Rgb       c1    = Scale(track, kDim);
+    if(engine.Playing() && now < beat_flash_until)
+        c1 = beat_flash_bar ? kWhite : track;
 
     const bool fast = (now / 125) % 2;
-    const bool slow = (now / 500) % 2;
     Rgb        c2   = kOff;
-    const looper::LayerState s = engine.State(selected);
-    switch(s)
+    if(hw.encoder.Pressed() || now < show_mode_until)
     {
-        case looper::LayerState::Empty: break;
-        case looper::LayerState::Armed: c2 = fast ? kRed : kOff; break;
-        case looper::LayerState::Recording:
-            c2 = (engine.StopPending() && fast) ? kOff : kRed;
-            break;
-        case looper::LayerState::Overdubbing: c2 = kAmber; break;
-        case looper::LayerState::Playing: c2 = kGreen; break;
-        case looper::LayerState::Muted: c2 = kBlue; break;
+        // Record mode: green = bar, cyan = beat, white = free; blinking =
+        // armed start (waits for the line), steady = starts on the press.
+        const looper::RecordMode m = engine.Mode();
+        c2 = m.quantize == Quantize::Bar ? kGreen : m.quantize == Quantize::Beat ? kCyan : kWhite;
+        if(m.quantize != Quantize::Free && m.start == StartMode::Armed && fast)
+            c2 = kOff;
     }
-    if(engine.Paused() && engine.HasLoop() && slow
-       && s != looper::LayerState::Recording)
-        c2 = kOff;
-    if(now < flash_until)
+    else
+    {
+        switch(engine.State(selected))
+        {
+            case TrackState::Empty: break;
+            case TrackState::Armed: c2 = fast ? kRed : kOff; break;
+            case TrackState::Recording:
+                c2 = (engine.EndPending(selected) && fast) ? kOff : kRed;
+                break;
+            case TrackState::Overdubbing: c2 = kAmber; break;
+            case TrackState::Playing: c2 = kGreen; break;
+            case TrackState::Muted: c2 = kBlue; break;
+        }
+    }
+    if(now < confirm_until)
         c2 = kWhite;
+    if(now < refuse_until)
+        c2 = fast ? kRed : kOff;
 
     hw.led1.Set(c1.r, c1.g, c1.b);
     hw.led2.Set(c2.r, c2.g, c2.b);
@@ -324,7 +412,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     const uint32_t now_ms = System::GetNow();
 
     HandleControls(now_ms);
-    HandleRemote();
+    HandleRemote(now_ms);
 
     // Place each clock message at the input sample that arrived when it did.
     // This block's input was captured over the last `size` samples, so a
@@ -350,40 +438,6 @@ void AudioCallback(AudioHandle::InputBuffer  in,
 
 // -------------------------------------------------------------- main loop
 
-// Clearing a layer hands its buffer here to be zeroed, a slice at a time so
-// MIDI keeps flowing.
-void ServiceZeroing()
-{
-    static int    layer = -1;
-    static size_t pos = 0, total = 0;
-    if(layer < 0)
-    {
-        for(int k = 0; k < kLayers; ++k)
-        {
-            if(engine.NeedsZero(k))
-            {
-                layer = k;
-                pos   = 0;
-                total = engine.ZeroFrames(k);
-                if(total > kMaxFrames)
-                    total = kMaxFrames;
-                break;
-            }
-        }
-        if(layer < 0)
-            return;
-    }
-    const size_t n = (total - pos) < 16384 ? (total - pos) : 16384;
-    std::memset(&buf_l[layer][pos], 0, n * sizeof(float));
-    std::memset(&buf_r[layer][pos], 0, n * sizeof(float));
-    pos += n;
-    if(pos >= total)
-    {
-        engine.MarkZeroed(layer);
-        layer = -1;
-    }
-}
-
 int main(void)
 {
     hw.Init(true); // 480 MHz
@@ -391,32 +445,33 @@ int main(void)
     hw.SetAudioBlockSize(cfg::kBlockSize);
     frames_per_us = hw.AudioSampleRate() * 1e-6f;
 
-    // SDRAM isn't cleared at power-on, and empty layers must be silent.
-    std::memset(buf_l, 0, sizeof(buf_l));
-    std::memset(buf_r, 0, sizeof(buf_r));
-
-    float* lp[kLayers];
-    float* rp[kLayers];
-    for(int k = 0; k < kLayers; ++k)
+    int16_t* lp[kTracks];
+    int16_t* rp[kTracks];
+    for(int t = 0; t < kTracks; ++t)
     {
-        lp[k] = buf_l[k];
-        rp[k] = buf_r[k];
+        lp[t] = buf_l[t];
+        rp[t] = buf_r[t];
     }
     looper::EngineConfig ec;
-    ec.sample_rate      = hw.AudioSampleRate();
-    ec.max_frames       = kMaxFrames;
-    ec.beats_per_bar    = cfg::kBeatsPerBar;
-    ec.quantize_to_bars = cfg::kQuantizeToBars;
-    ec.follow_transport = cfg::kFollowMidiTransport;
-    engine.Init(ec, lp, rp, kLayers);
+    ec.sample_rate          = hw.AudioSampleRate();
+    ec.max_frames           = kMaxFrames;
+    ec.beats_per_bar        = cfg::kBeatsPerBar;
+    ec.tempo                = cfg::kDefaultTempo;
+    ec.min_tempo            = cfg::kMinTempo;
+    ec.max_tempo            = cfg::kMaxTempo;
+    ec.follow_clock         = cfg::kFollowMidiClock;
+    ec.record_mode.quantize = cfg::kDefaultQuantize;
+    ec.record_mode.start    = cfg::kDefaultStart;
+    engine.Init(ec, lp, rp, undo_l, undo_r, kTracks);
+    for(int i = 0; i < kNumModes; ++i)
+        if(kModes[i].quantize == ec.record_mode.quantize
+           && kModes[i].start == ec.record_mode.start)
+            mode_index = i;
 
     hw.StartAdc();
     hw.midi.StartReceiveRt(OnMidiRealtime);
     hw.StartAudio(AudioCallback);
 
     for(;;)
-    {
         PollMidi();
-        ServiceZeroing();
-    }
 }
