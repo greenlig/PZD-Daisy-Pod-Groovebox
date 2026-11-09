@@ -1,9 +1,10 @@
-// Pod Looper - a screenless 4-track looper for a stock Electrosmith Daisy
-// Pod, with its own tempo or MIDI clock sync (built around a Roland P-6).
+// Pod Looper - a screenless 4-track looper with a small CS-80-inspired
+// polysynth, for a stock Electrosmith Daisy Pod. Runs on its own tempo or
+// MIDI clock (built around a Roland P-6).
 //
 // This file is the Pod-specific part: it reads the buttons, encoder, knobs
-// and MIDI, drives the two RGB LEDs, and feeds audio through looper::Engine.
-// See README.md for the controls.
+// and MIDI, drives the two RGB LEDs, plays the synth and feeds everything
+// through looper::Engine. See README.md for the controls.
 
 #include <cmath>
 
@@ -12,6 +13,7 @@
 #include "config.h"
 #include "looper.h"
 #include "spsc_queue.h"
+#include "synth.h"
 
 using namespace daisy;
 using looper::Quantize;
@@ -48,6 +50,11 @@ constexpr Rgb kTrackColour[4] = {{0.f, 1.f, 1.f},
                                  {1.f, 0.f, 1.f},
                                  {1.f, 1.f, 0.f},
                                  {1.f, 1.f, 1.f}};
+// LED 2 colour shown when a synth patch is picked: Blade, Strings, Bass, Bells.
+constexpr Rgb kPatchColour[synth::kPatches] = {{1.f, 0.35f, 0.f},
+                                               {1.f, 0.f, 1.f},
+                                               {0.f, 0.f, 1.f},
+                                               {0.f, 1.f, 1.f}};
 constexpr float kDim = 0.45f; // LED 1 between beats (the LED driver cubes it)
 
 // Record modes in the order Shift + Button 2 steps through them.
@@ -68,16 +75,30 @@ struct SyncMsg
     uint32_t         us;
 };
 
-// Notes and CCs, from the main loop to the audio callback.
-struct RemoteMsg
+// Everything else from MIDI, sorted in the main loop and acted on in the
+// audio callback.
+enum class Kind : uint8_t
 {
-    bool    is_cc;
-    uint8_t num;
-    uint8_t value;
+    LooperPad,   // a = pad 0-5
+    LooperCc,    // a = cc, b = value
+    NoteOn,      // a = note, b = velocity
+    PadNoteOn,   // same, from a P-6 pad: releases itself if no note-off comes
+    NoteOff,     // a = note
+    SynthCc,     // a = cc, b = value
+    Bend,        // a = low 7 bits, b = high 7 bits (0..16383)
+    Pressure,    // b = value
+    PolyPressure, // a = note, b = value
+    Program,     // a = program
+};
+struct MidiMsg
+{
+    Kind    kind;
+    uint8_t a;
+    uint8_t b;
 };
 
 // A knob only takes over a value once it has been moved, so selecting a
-// track (or a CC change) never makes the level jump.
+// track (or a CC change, or letting go of Shift) never makes a value jump.
 struct Pickup
 {
     float ref  = 0.f;
@@ -99,31 +120,34 @@ struct Pickup
 
 DaisyPod       hw;
 looper::Engine engine;
+synth::Synth   poly;
 
 int16_t DSY_SDRAM_BSS buf_l[kTracks][kMaxFrames];
 int16_t DSY_SDRAM_BSS buf_r[kTracks][kMaxFrames];
 int16_t DSY_SDRAM_BSS undo_l[kMaxFrames];
 int16_t DSY_SDRAM_BSS undo_r[kMaxFrames];
 
-SpscQueue<SyncMsg, 128>  sync_q;
-SpscQueue<RemoteMsg, 64> remote_q;
+SpscQueue<SyncMsg, 128> sync_q;
+SpscQueue<MidiMsg, 128> midi_q;
 
 // UI state, touched only by the audio callback.
-int      selected      = 0;
-int      mode_index    = 0;
-Pickup   knob1, knob2;
-bool     b2_cleared    = false;
-bool     b2_fresh      = false;
-bool     b2_was_shift  = false;
-uint32_t enc_down_at   = 0;
-bool     shift_used    = false;
-int      boot_blocks   = 0;
+int      selected        = 0;
+int      mode_index      = 0;
+Pickup   knob1, knob2;           // track volume, live level
+Pickup   shift_k1, shift_k2;     // brightness, patch (while Shift is held)
+bool     b2_cleared      = false;
+bool     b2_fresh        = false;
+bool     b2_was_shift    = false;
+uint32_t enc_down_at     = 0;
+bool     shift_used      = false;
+int      boot_blocks     = 0;
 uint32_t beat_flash_until = 0;
 bool     beat_flash_bar   = false;
 uint32_t last_beat_count  = 0;
 uint32_t confirm_until    = 0; // white flash on LED 2
 uint32_t refuse_until     = 0; // red flash on LED 2
 uint32_t show_mode_until  = 0;
+uint32_t show_patch_until = 0;
 float    frames_per_us    = 0.048f;
 
 inline float KnobToGain(float k)
@@ -155,6 +179,14 @@ void DoUndo(uint32_t now)
         Refuse(now);
 }
 
+void PickPatch(int p, uint32_t now)
+{
+    if(p == poly.PatchIndex())
+        return;
+    poly.SetPatch(p);
+    show_patch_until = now + 1500;
+}
+
 // ------------------------------------------------------------------- MIDI
 
 // Runs inside the UART interrupt: just timestamp and queue.
@@ -178,25 +210,109 @@ inline bool OnControlChannel(int channel) // libDaisy channels are 0-15
     return cfg::kControlChannel == 0 || channel == cfg::kControlChannel - 1;
 }
 
-// Main loop: forward notes and CCs on the control channel to the audio side.
+inline bool OnSynthChannel(int channel)
+{
+    return cfg::kSynthChannel == 0 ? !OnControlChannel(channel)
+                                   : channel == cfg::kSynthChannel - 1;
+}
+
+// A P-6 pad in banks E-G -> a note of the scale, one octave per bank.
+inline int PadToSynthNote(int pad_note)
+{
+    const int i = pad_note - cfg::kSynthPadFirstNote;
+    return cfg::kSynthPadRoot + 12 * (i / 6) + cfg::kSynthPadScale[i % 6];
+}
+
+void RouteNote(int channel, uint8_t note, uint8_t velocity, bool on)
+{
+    if(OnControlChannel(channel))
+    {
+        const int pad = static_cast<int>(note) - cfg::kPadNoteBase;
+        if(pad >= 0 && pad < kTracks + 2)
+        {
+            if(on)
+                midi_q.Push({Kind::LooperPad, static_cast<uint8_t>(pad), 0});
+            return;
+        }
+        if(cfg::kPadsPlaySynth && note >= cfg::kSynthPadFirstNote
+           && note <= cfg::kSynthPadLastNote)
+        {
+            const uint8_t n = static_cast<uint8_t>(PadToSynthNote(note));
+            midi_q.Push({on ? Kind::PadNoteOn : Kind::NoteOff, n, velocity});
+        }
+        return;
+    }
+    if(OnSynthChannel(channel))
+        midi_q.Push({on ? Kind::NoteOn : Kind::NoteOff, note, velocity});
+}
+
+// Main loop: sort incoming MIDI for the audio side.
 void PollMidi()
 {
     hw.midi.Listen();
     while(hw.midi.HasEvents())
     {
         MidiEvent e = hw.midi.PopEvent();
-        if(e.type == NoteOn)
+        switch(e.type)
         {
-            const NoteOnEvent n = e.AsNoteOn();
-            // The P-6 sends note-ons only; velocity 0 would mean note-off.
-            if(n.velocity > 0 && OnControlChannel(n.channel))
-                remote_q.Push({false, n.note, n.velocity});
-        }
-        else if(e.type == ControlChange)
-        {
-            const ControlChangeEvent c = e.AsControlChange();
-            if(OnControlChannel(c.channel))
-                remote_q.Push({true, c.control_number, c.value});
+            case NoteOn:
+            {
+                const NoteOnEvent n = e.AsNoteOn();
+                RouteNote(n.channel, n.note, n.velocity, true);
+                break;
+            }
+            case NoteOff: // libDaisy also delivers velocity-0 note-ons as these
+            {
+                const NoteOffEvent n = e.AsNoteOff();
+                RouteNote(n.channel, n.note, 0, false);
+                break;
+            }
+            case ControlChange:
+            {
+                const ControlChangeEvent c = e.AsControlChange();
+                const int cc = c.control_number;
+                if(OnControlChannel(c.channel) && cc >= cfg::kTrackVolumeCcBase
+                   && cc <= cfg::kMonitorCc)
+                    midi_q.Push({Kind::LooperCc, c.control_number, c.value});
+                else if(OnSynthChannel(c.channel))
+                    midi_q.Push({Kind::SynthCc, c.control_number, c.value});
+                break;
+            }
+            case PitchBend:
+            {
+                const PitchBendEvent p = e.AsPitchBend();
+                if(OnSynthChannel(p.channel))
+                {
+                    const int v = p.value + 8192; // 0..16383
+                    midi_q.Push({Kind::Bend, static_cast<uint8_t>(v & 0x7f),
+                                 static_cast<uint8_t>((v >> 7) & 0x7f)});
+                }
+                break;
+            }
+            case ChannelPressure:
+            {
+                const ChannelPressureEvent p = e.AsChannelPressure();
+                if(OnSynthChannel(p.channel))
+                    midi_q.Push({Kind::Pressure, 0, p.pressure});
+                break;
+            }
+            case PolyphonicKeyPressure:
+            {
+                const PolyphonicKeyPressureEvent p = e.AsPolyphonicKeyPressure();
+                if(OnSynthChannel(p.channel))
+                    midi_q.Push({Kind::PolyPressure, p.note, p.pressure});
+                break;
+            }
+            case ProgramChange:
+            {
+                // Only on a dedicated synth channel: the P-6 sends program
+                // changes of its own when it changes patterns.
+                const ProgramChangeEvent p = e.AsProgramChange();
+                if(cfg::kSynthChannel != 0 && OnSynthChannel(p.channel))
+                    midi_q.Push({Kind::Program, p.program, 0});
+                break;
+            }
+            default: break;
         }
     }
 }
@@ -207,6 +323,8 @@ void PollMidi()
 //   turn       = tempo -/+ 1 BPM
 //   Button 1   = undo / redo
 //   Button 2   = next record mode
+//   Knob 1     = synth brightness
+//   Knob 2     = synth patch (four zones: Blade, Strings, Bass, Bells)
 // A short click on its own (no Shift action) is Play / Stop.
 
 void HandleControls(uint32_t now)
@@ -219,7 +337,7 @@ void HandleControls(uint32_t now)
     {
         ++boot_blocks;
         knob1.Hold(k1);  // track volumes start at unity
-        knob2.ref  = k2; // the input level follows Knob 2 from the start
+        knob2.ref  = k2; // the live level follows Knob 2 from the start
         knob2.live = true;
         engine.SetMonitor(KnobToGain(k2));
         return;
@@ -229,6 +347,8 @@ void HandleControls(uint32_t now)
     {
         enc_down_at = now;
         shift_used  = false;
+        shift_k1.Hold(k1);
+        shift_k2.Hold(k2);
     }
     const bool shift = hw.encoder.Pressed();
 
@@ -245,10 +365,13 @@ void HandleControls(uint32_t now)
             SelectTrack(((selected + inc) % kTracks + kTracks) % kTracks);
     }
 
-    if(hw.encoder.FallingEdge() && !shift_used && now - enc_down_at < kClickMaxMs)
+    if(hw.encoder.FallingEdge())
     {
-        if(!engine.TransportToggle())
+        if(!shift_used && now - enc_down_at < kClickMaxMs && !engine.TransportToggle())
             Refuse(now); // the P-6 is in charge of Play/Stop
+        // Hand the knobs back to volume and live level without a jump.
+        knob1.Hold(k1);
+        knob2.Hold(k2);
     }
 
     // Button 1: Rec / Play / Dub (Shift: undo / redo).
@@ -275,7 +398,8 @@ void HandleControls(uint32_t now)
             shift_used = true;
             mode_index = (mode_index + 1) % kNumModes;
             engine.SetRecordMode(kModes[mode_index]);
-            show_mode_until = now + 1500;
+            show_mode_until  = now + 1500;
+            show_patch_until = 0;
         }
         else
             engine.StopToggle(selected);
@@ -292,51 +416,97 @@ void HandleControls(uint32_t now)
         if(!b2_fresh && held >= kStartFreshHoldMs)
         {
             engine.StartFresh();
+            poly.AllNotesOff();
             b2_fresh = true;
             Confirm(now);
         }
     }
 
-    // Knob 1: selected track's volume. Knob 2: live input level.
-    if(knob1.Update(k1))
-        engine.SetVolume(selected, KnobToGain(k1));
-    if(knob2.Update(k2))
-        engine.SetMonitor(KnobToGain(k2));
+    if(shift)
+    {
+        // Shift + knobs: the synth.
+        if(shift_k1.Update(k1))
+        {
+            shift_used = true;
+            poly.SetBrightness(k1);
+        }
+        if(shift_k2.Update(k2))
+        {
+            shift_used = true;
+            int p = static_cast<int>(k2 * synth::kPatches);
+            PickPatch(p < synth::kPatches ? p : synth::kPatches - 1, now);
+        }
+    }
+    else
+    {
+        // Knob 1: selected track's volume. Knob 2: live level (input + synth).
+        if(knob1.Update(k1))
+            engine.SetVolume(selected, KnobToGain(k1));
+        if(knob2.Update(k2))
+            engine.SetMonitor(KnobToGain(k2));
+    }
 }
 
-void HandleRemote(uint32_t now)
+void HandleMidi(uint32_t now)
 {
-    RemoteMsg m;
-    while(remote_q.Pop(m))
+    MidiMsg m;
+    while(midi_q.Pop(m))
     {
-        if(!m.is_cc)
+        switch(m.kind)
         {
-            const int pad = static_cast<int>(m.num) - cfg::kPadNoteBase;
-            if(pad >= 0 && pad < kTracks)
+            case Kind::LooperPad:
+                if(m.a < kTracks)
+                {
+                    SelectTrack(m.a);
+                    engine.RecPlayDub(m.a);
+                }
+                else if(m.a == kTracks)
+                    engine.StopToggle(selected);
+                else
+                    DoUndo(now);
+                break;
+
+            case Kind::LooperCc:
             {
-                SelectTrack(pad);
-                engine.RecPlayDub(pad);
+                const float v = m.b / 127.f;
+                const int   t = static_cast<int>(m.a) - cfg::kTrackVolumeCcBase;
+                if(t >= 0 && t < kTracks)
+                {
+                    engine.SetVolume(t, KnobToGain(v));
+                    if(t == selected)
+                        knob1.Hold(hw.knob1.Value());
+                }
+                else if(m.a == cfg::kMonitorCc)
+                {
+                    engine.SetMonitor(KnobToGain(v));
+                    knob2.Hold(hw.knob2.Value());
+                }
+                break;
             }
-            else if(pad == kTracks)
-                engine.StopToggle(selected);
-            else if(pad == kTracks + 1)
-                DoUndo(now);
-        }
-        else
-        {
-            const float v = m.value / 127.f;
-            const int   t = static_cast<int>(m.num) - cfg::kTrackVolumeCcBase;
-            if(t >= 0 && t < kTracks)
-            {
-                engine.SetVolume(t, KnobToGain(v));
-                if(t == selected)
-                    knob1.Hold(hw.knob1.Value());
-            }
-            else if(m.num == cfg::kMonitorCc)
-            {
-                engine.SetMonitor(KnobToGain(v));
-                knob2.Hold(hw.knob2.Value());
-            }
+
+            case Kind::NoteOn: poly.NoteOn(m.a, m.b); break;
+            case Kind::PadNoteOn: poly.NoteOn(m.a, m.b, cfg::kPadMaxHoldSeconds); break;
+            case Kind::NoteOff: poly.NoteOff(m.a); break;
+
+            case Kind::SynthCc:
+                switch(m.a)
+                {
+                    case 1: poly.SetModWheel(m.b / 127.f); break;
+                    case 64: poly.SetSustain(m.b >= 64); break;
+                    case 71: poly.SetResonanceOffset((m.b - 64) / 128.f); break;
+                    case 74: poly.SetBrightness(m.b / 127.f); break;
+                    case 120:
+                    case 123: poly.AllNotesOff(); break;
+                    default: break;
+                }
+                break;
+
+            case Kind::Bend:
+                poly.SetPitchBend(((m.b << 7 | m.a) - 8192) / 8192.f);
+                break;
+            case Kind::Pressure: poly.SetPressure(m.b / 127.f); break;
+            case Kind::PolyPressure: poly.SetPolyPressure(m.a, m.b / 127.f); break;
+            case Kind::Program: PickPatch(m.a % synth::kPatches, now); break;
         }
     }
 }
@@ -345,8 +515,8 @@ void HandleRemote(uint32_t now)
 //
 // LED 1: the selected track's colour, pulsing bright on every beat and white
 //        on the first beat of each bar. Steady and dim = stopped.
-// LED 2: what that track is doing (see README), or the record mode while
-//        the encoder is held.
+// LED 2: what that track is doing (see README); the record mode while the
+//        encoder is held; the synth patch's colour just after it changes.
 
 Rgb Scale(Rgb c, float k)
 {
@@ -369,7 +539,9 @@ void UpdateLeds(uint32_t now)
 
     const bool fast = (now / 125) % 2;
     Rgb        c2   = kOff;
-    if(hw.encoder.Pressed() || now < show_mode_until)
+    if(now < show_patch_until)
+        c2 = kPatchColour[poly.PatchIndex()];
+    else if(hw.encoder.Pressed() || now < show_mode_until)
     {
         // Record mode: green = bar, cyan = beat, white = free; blinking =
         // armed start (waits for the line), steady = starts on the press.
@@ -412,7 +584,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     const uint32_t now_ms = System::GetNow();
 
     HandleControls(now_ms);
-    HandleRemote(now_ms);
+    HandleMidi(now_ms);
 
     // Place each clock message at the input sample that arrived when it did.
     // This block's input was captured over the last `size` samples, so a
@@ -431,7 +603,19 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         events[num_events++] = {m.type, static_cast<uint32_t>(frame)};
     }
 
-    engine.Process(in[0], in[1], out[0], out[1], size, events, num_events);
+    // The synth joins the live input, so it's heard (Knob 2) and can be
+    // recorded into a track like anything else you play.
+    float live_l[cfg::kBlockSize], live_r[cfg::kBlockSize];
+    if(size > cfg::kBlockSize)
+        size = cfg::kBlockSize;
+    poly.Process(live_l, live_r, size);
+    for(size_t i = 0; i < size; ++i)
+    {
+        live_l[i] = in[0][i] + live_l[i] * cfg::kSynthLevel;
+        live_r[i] = in[1][i] + live_r[i] * cfg::kSynthLevel;
+    }
+
+    engine.Process(live_l, live_r, out[0], out[1], size, events, num_events);
 
     UpdateLeds(now_ms);
 }
@@ -467,6 +651,9 @@ int main(void)
         if(kModes[i].quantize == ec.record_mode.quantize
            && kModes[i].start == ec.record_mode.start)
             mode_index = i;
+
+    poly.Init(hw.AudioSampleRate());
+    poly.SetPatch(cfg::kDefaultSynthPatch);
 
     hw.StartAdc();
     hw.midi.StartReceiveRt(OnMidiRealtime);

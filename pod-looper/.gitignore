@@ -1,2 +1,3 @@
 build/
 test/engine_test
+test/synth_test

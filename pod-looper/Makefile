@@ -7,7 +7,7 @@
 
 TARGET = pod-looper
 
-CPP_SOURCES = src/main.cpp src/looper.cpp
+CPP_SOURCES = src/main.cpp src/looper.cpp src/synth.cpp
 
 LIBDAISY_DIR = libDaisy
 

@@ -59,4 +59,24 @@ constexpr int kPadNoteBase = 90;
 constexpr int kTrackVolumeCcBase = 102; // CC 102-105 = track 1-4 volume
 constexpr int kMonitorCc         = 106; // live input level
 
+// ---------------------------------------------------------------- synth --
+
+// Notes on this channel (1-16) play the synth chromatically, for any MIDI
+// keyboard. 0 = any channel except kControlChannel.
+constexpr int kSynthChannel = 0;
+
+// The P-6 can't send a chromatic keyboard (each pad is a fixed note), so its
+// pads in banks E, F and G (notes 72-89 on kControlChannel) play the synth
+// in a scale instead: six notes per bank, one octave per bank. Leave those
+// banks empty on the P-6. Banks A-D stay yours; bank H runs the looper.
+constexpr bool  kPadsPlaySynth      = true;
+constexpr int   kSynthPadFirstNote  = 72;                      // bank E pad 1
+constexpr int   kSynthPadLastNote   = 89;                      // bank G pad 6
+constexpr int   kSynthPadRoot       = 48;                      // C3: bank E = C3.., F = C4.., G = C5..
+constexpr int   kSynthPadScale[6]   = {0, 2, 3, 5, 7, 10};     // minor hexatonic: C D Eb F G Bb
+constexpr float kPadMaxHoldSeconds  = 8.f; // a pad note releases itself if no note-off arrives
+
+constexpr int   kDefaultSynthPatch = 0;   // 0 Blade, 1 Strings, 2 Bass, 3 Bells
+constexpr float kSynthLevel        = 1.f; // synth level into the mix
+
 } // namespace cfg
