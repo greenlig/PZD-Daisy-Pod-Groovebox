@@ -1,0 +1,3 @@
+[submodule "pod-looper/libDaisy"]
+	path = pod-looper/libDaisy
+	url = https://github.com/electro-smith/libDaisy.git
